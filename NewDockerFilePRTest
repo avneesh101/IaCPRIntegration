@@ -14,13 +14,15 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+FROM nginx:alpine
+
+RUN echo "SUCCESS"
+
+FROM --platform=$BUILDPLATFORM golang:alpine AS build
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+RUN echo "I'm Service A and I am building for $TARGETPLATFORM, running on $BUILDPLATFORM" > /log
 
 FROM alpine
-
-RUN echo "foo" > /tmp/expected
-RUN --mount=type=secret,id=mysecret cat /run/secrets/mysecret > /tmp/actual
-RUN diff /tmp/expected /tmp/actual
-
-RUN echo "bar" > /tmp/expected
-RUN --mount=type=secret,id=build_secret cat /run/secrets/build_secret > tmp/actual
-RUN diff --ignore-all-space /tmp/expected /tmp/actual
+COPY --from=build /log /log
