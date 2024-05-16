@@ -14,5 +14,4 @@
 
 FROM busybox
 RUN sleep infinity
-RUN apt-get --no-install-recommends update -y
 
