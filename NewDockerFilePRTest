@@ -17,3 +17,12 @@
 FROM nginx:alpine
 
 RUN echo "SUCCESS"
+
+FROM --platform=$BUILDPLATFORM golang:alpine AS build
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+RUN echo "I'm Service A and I am building for $TARGETPLATFORM, running on $BUILDPLATFORM" > /log
+
+FROM alpine
+COPY --from=build /log /log
