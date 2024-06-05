@@ -1,0 +1,284 @@
+# https://raw.githubusercontent.com/awsdocs/aws-lambda-developer-guide/main/templates/vpc-privatepublic.yaml
+
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  ClassB:
+    Description: Class B of VPC (10.XXX.0.0/16)
+    Type: String
+    MinLength: '1'
+    MaxLength: '3'
+    Default: '1'
+  APIGWEndpointDNSName:
+    Type: String
+    Default: xxxxxx.execute-api.REGION.amazonaws.com
+    Description: DNS name of your API Gateway Endpoint.
+Resources:
+  pubPrivateVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Join
+        - ''
+        - - '10.'
+          - !Ref ClassB
+          - .0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  publicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+      AvailabilityZone:
+        Fn::Select:
+         - 0
+         - Fn::GetAZs: ""
+      CidrBlock: !Join
+        - ''
+        - - '10.'
+          - !Ref ClassB
+          - .0.0/22
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref "AWS::StackName","public-subnet"]]
+  privateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+      AvailabilityZone:
+        Fn::Select:
+         - 0
+         - Fn::GetAZs: ""
+      CidrBlock: !Join
+        - ''
+        - - '10.'
+          - !Ref ClassB
+          - .128.0/22
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref "AWS::StackName","private-subnet-a"]]
+  privateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+      AvailabilityZone:
+        Fn::Select:
+         - 1
+         - Fn::GetAZs: ""
+      CidrBlock: !Join
+        - ''
+        - - '10.'
+          - !Ref ClassB
+          - .132.0/22
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref "AWS::StackName","private-subnet-b"]]
+  internetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join ["-", [!Ref "AWS::StackName","gateway"]]
+  gatewayToInternet:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+      InternetGatewayId: !Ref internetGateway
+  publicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+  publicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: gatewayToInternet
+    Properties:
+      RouteTableId: !Ref publicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref internetGateway
+  publicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref publicSubnet1
+      RouteTableId: !Ref publicRouteTable
+  natGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: natPublicIP
+    Properties:
+      AllocationId: !GetAtt natPublicIP.AllocationId
+      SubnetId: !Ref publicSubnet1
+  natPublicIP:
+    Type: AWS::EC2::EIP
+    DependsOn: pubPrivateVPC
+    Properties:
+      Domain: vpc
+  privateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+  privateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref privateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref natGateway
+  privateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref privateSubnet1
+      RouteTableId: !Ref privateRouteTable
+  privateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref privateSubnet2
+      RouteTableId: !Ref privateRouteTable
+  apiTesterFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Runtime: nodejs12.x
+      Timeout: 35
+      Handler: index.handler
+      Code:
+        ZipFile: !Join 
+          - |+
+
+          - - var https = require('https');
+            - 'const options = {'
+            - '  host: process.env.VPCE_DNS_NAME,'
+            - '  port: 443,'
+            - '  path: ''/demo/pets'','
+            - '  method: ''GET'','
+            - '  headers: {'
+            - '    ''Host'':process.env.API_GW_ENDPOINT'
+            - '  }'
+            - '};'
+            - 'exports.handler = (event, context, callback) => {'
+            - '    https.request(options, (res) => {'
+            - '      console.log(''statusCode:'', res.statusCode);'
+            - '      console.log(''headers:'', res.headers);'
+            - '      let data = '''';'
+            - '      res.on(''data'', (d) => {'
+            - '       data += d;'
+            - '        process.stdout.write(d);'
+            - '      });'
+            - '      res.on(''end'', () => {'
+            - '         callback(null, JSON.parse(data));'
+            - '      });'
+            - '    }).on(''error'', (e) => {'
+            - '      console.error(e);'
+            - '      callback(null, e);'
+            - '    }).end();'
+            - '};'
+      Environment:
+        Variables:
+          VPCE_DNS_NAME: !Select 
+            - 1
+            - !Split
+              - ':'
+              - !Select
+                - 0
+                - !GetAtt
+                  - vpcEndpoint
+                  - DnsEntries
+          API_GW_ENDPOINT: !Ref APIGWEndpointDNSName
+      Role: !GetAtt 
+        - APITesterFunctionRole
+        - Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref apiTesterSG
+        SubnetIds:
+          - !Ref privateSubnet1
+          - !Ref privateSubnet2
+  APITesterFunctionRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+    Type: 'AWS::IAM::Role'
+  apiTesterSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+      GroupDescription: SG for Lambda function
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '0'
+          ToPort: '65535'
+          CidrIp: 0.0.0.0/0
+  vpceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref pubPrivateVPC
+      GroupDescription: Security Group for API Gateway VPC Endpoint
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: '0.0.0.0/0'
+  vpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.execute-api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: "*"
+          Action: "*"
+          Resource: "*"
+      VpcId: !Ref pubPrivateVPC
+      SecurityGroupIds:
+        - !Ref vpceSecurityGroup
+      SubnetIds:
+        - !Ref privateSubnet1
+        - !Ref privateSubnet2
+Outputs:
+  pubPrivateVPCID:
+    Description: VPC ID
+    Value: !Ref pubPrivateVPC
+    Export:
+      Name: !Join ["-", [!Ref "AWS::StackName","vpc"]]
+  publicSubnet1ID:
+    Description: Public Subnet A ID
+    Value: !Ref publicSubnet1
+    Export:
+      Name: !Join ["-", [!Ref "AWS::StackName","public-subnet-a"]]
+  privateSubnet1ID:
+    Description: Private Subnet A ID
+    Value: !Ref privateSubnet1
+    Export:
+      Name: !Join ["-", [!Ref "AWS::StackName","private-subnet-a"]]
+  privateSubnet2ID:
+    Description: Private Subnet B ID
+    Value: !Ref privateSubnet2
+    Export:
+      Name: !Join ["-", [!Ref "AWS::StackName","private-subnet-b"]]
+  apiVPCSecurityGroup:
+    Description: security group for Lambda
+    Value: !Ref apiTesterSG
+    Export:
+      Name: !Join ["-", [!Ref "AWS::StackName","vpc-lambda-sg"]]
+  vpceVPCSecurityGroup:
+    Description: security group for API Endpoint
+    Value: !Ref vpceSecurityGroup
+    Export:
+      Name: !Join ["-", [!Ref "AWS::StackName","vpc-vpce-sg"]]
+  apiVPCEndpoint:
+    Description: VPC Endpoint for API Gateway
+    Value: !Ref vpcEndpoint
+    Export:
+      Name: !Join ["-", [!Ref "AWS::StackName","vpc-vpce-api"]]
