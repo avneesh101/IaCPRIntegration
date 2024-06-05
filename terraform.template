@@ -1,0 +1,40 @@
+terraform {
+  required_providers {
+    spotinst = {
+      source = "spotinst/spotinst"
+      version = "1.81.0"
+    }
+  }
+}
+
+provider "spotinst" {
+   token   = "glpat-H2qssBXo9Ne-tz62x5K1"
+}
+
+
+resource "spotinst_elastigroup_aws" "default-elastigroup" {
+
+  name        = "default-elastigroup"
+  description = "created by Terraform"
+  product     = "Linux/UNIX"
+
+  max_size         = 1
+  min_size         = 1
+  desired_capacity = 1
+  capacity_unit    = "instance"
+
+  region     = "us-west-2"
+  subnet_ids = ["subnet-12345"]
+
+  image_id             = "ami-123456"
+  key_name             = "automation-kp"
+  security_groups      = ["sg-123456"]
+
+
+  instance_types_ondemand       = "t2.micro"
+  instance_types_spot           = ["m3.xlarge", "t2.micro"]
+
+  orientation               = "balanced"
+  fallback_to_ondemand      = false
+
+}
