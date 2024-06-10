@@ -1,0 +1,711 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Parameters:
+  Neo4jUser:
+    Description: Neo4j User Name
+    Type: String
+  Neo4jPass:
+    Description: Neo4j Password
+    Type: String
+    NoEcho: true
+  AzureServer:
+    Description: Postgres Host Name in Azure
+    Type: String
+  PGDataServerDbName:
+    Description: Postgres Database Name
+    Type: String
+  PGDataServerUser:
+    Description: Postgres User Name
+    Type: String
+  PGDataServerPass:
+    Description: Postgres Password
+    Type: String
+    NoEcho: true
+  PostgresSG:
+    Description: Postgres Security Group Id
+    Type: String
+  LambdaSG:
+    Description: Lambda Security Group Id
+    Type: String
+  SubnetAPrivate:
+    Description: PrivateA Subnet Id
+    Type: String
+  SubnetBPrivate:
+    Description: PrivateB Subnet Id
+    Type: String
+  SubnetAPublic:
+    Description: PublicA Subnet Id
+    Type: String
+  SubnetBPublic:
+    Description: PublicB Subnet Id
+    Type: String
+  S3OutputBucket:
+    Description: S3 bucket name for ETL data
+    Type: String
+  JWTSecretKeyName:
+    Description: Key name in Parameter Store for JWT Secret
+    Type: String
+  SlackWebUrl:
+    Type: String
+    Description: Webhook url for Slack
+  IsDev:
+    Type: String
+  Version:
+    Description: Version of API
+    Type: String
+    Default: 'v1'
+  AAECR:
+    Type: String
+    Description: Name of Affected Assets ECR repository
+  EFSpath:
+    Type: String
+    Default: /mnt/api
+  Layer:
+    Type: String
+    Description: Layer version for Lambda functions
+  CH:
+    Type: String
+  DataEncryptionKeyArn:
+    Type: String
+    Description: KMS Key for encrypting data
+
+Resources:
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: PostgreSQL Subnets
+      SubnetIds:
+        - !Ref SubnetAPublic
+        - !Ref SubnetBPublic
+  PostgreSQLDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref PostgresSG
+      AllocatedStorage: '100'
+      StorageType: gp2
+      DBInstanceClass: db.m6g.large
+      Engine: postgres
+      EngineVersion: 13.4
+      MasterUsername: !Ref PGDataServerUser
+      MasterUserPassword: !Ref PGDataServerPass
+      PubliclyAccessible: true
+    DeletionPolicy: Snapshot
+  LambdaFunctionIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "AllowLambdaServiceToAssumeRole"
+            Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        -
+          PolicyName: "InlinePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "iam:*"
+                  - "kms:*"
+                  - "s3:*"
+                  - "sts:*"
+                  - "ec2:*"
+                  - "ssm:*"
+                  - "sqs:*"
+                  - "elasticfilesystem:*"
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  FileSystemResource:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      PerformanceMode: maxIO
+      Encrypted: true
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_1_DAY
+      FileSystemTags:
+        - Key: Name
+          Value: FSForAPI
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "elasticfilesystem:ClientMount"
+            Principal:
+              AWS: "*"
+
+  MountTargetResource1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      SubnetId: !Ref SubnetAPrivate
+      SecurityGroups:
+        - !Ref LambdaSG
+    DependsOn: FileSystemResource
+
+  MountTargetResource2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      SubnetId: !Ref SubnetBPrivate
+      SecurityGroups:
+        - !Ref LambdaSG
+    DependsOn: FileSystemResource
+
+  AccessPointResource:
+    Type: 'AWS::EFS::AccessPoint'
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      PosixUser:
+        Uid: "1001"
+        Gid: "1001"
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: "1001"
+          OwnerUid: "1001"
+          Permissions: "0755"
+        Path: "/mnt/api"
+    DependsOn: MountTargetResource1
+
+  ApiGatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: swagger.yml
+      StageName: !Ref Version
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      CodeUri: ./src
+      Role: !GetAtt LambdaFunctionIAMRole.Arn
+      MemorySize: 10240
+      Timeout: 300
+      KmsKeyArn: !Ref DataEncryptionKeyArn
+      Environment:
+        Variables:
+          PG_ENV_SERVER_HOST_NAME: !GetAtt PostgreSQLDatabase.Endpoint.Address
+          PG_EVENT_SERVER_HOST_NAME: !GetAtt PostgreSQLDatabase.Endpoint.Address
+          PG_DATABASE_NAME: !Ref PGDataServerDbName
+          PG_USER_NAME: !Ref PGDataServerUser
+          PG_PASSWORD: !Ref PGDataServerPass
+          NEO4J_USER_NAME: !Ref Neo4jUser
+          NEO4J_PASSWORD: !Ref Neo4jPass
+          S3_OUTPUT_BUCKET_NAME: !Ref S3OutputBucket
+          JWT_SECRET_KEY_NAME: !Ref JWTSecretKeyName
+          SLACK_WEBHOOK: !Ref SlackWebUrl
+          RUNNING_FROM_DEV: !Ref IsDev
+          PG_AZURE_DATA_SERVER_HOST_NAME: !Ref AzureServer
+          PG_AZURE_PASSWORD: !Ref PGDataServerPass
+          CH: !Ref CH
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:secops-python-packages:${Layer}
+      FileSystemConfigs:
+        - Arn: !GetAtt AccessPointResource.Arn
+          LocalMountPath: !Ref EFSpath
+      Events:
+        ProxyApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGatewayApi
+            Path: /{proxy+}
+            Method: ANY
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Description: Scheduler to prevent cold start
+            Schedule: cron(0/2 * * * ? *)
+            Enabled: True
+      ReservedConcurrentExecutions: 100
+
+  PostProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/prioritization/post_processing/
+      Handler: handler_post_processing.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - x86_64
+      MemorySize: 8192
+      Role: !GetAtt LambdaFunctionIAMRole.Arn
+      Timeout: 600
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:secops-python-packages:${Layer}
+      KmsKeyArn: !Ref DataEncryptionKeyArn
+      Environment:
+        Variables:
+          PG_DATABASE_NAME: !Ref PGDataServerDbName
+          PG_TRANSITION_DATABASE_NAME: "db_transition"
+          PG_USER_NAME: !Ref PGDataServerUser
+          PG_PASSWORD: !Ref PGDataServerPass
+          PG_TABLE_NAME: 'flagged'
+          NEO4J_USER_NAME: !Ref Neo4jUser
+          NEO4J_PASSWORD: !Ref Neo4jPass
+          USE_SERVER_NODE: "True"
+          RUNNING_FROM_LOCAL: "True"
+          PG_ENV_SERVER_HOST_NAME: !GetAtt PostgreSQLDatabase.Endpoint.Address
+          PG_AZURE_DATA_SERVER_HOST_NAME: !Ref AzureServer
+          S3_OUTPUT_BUCKET_NAME: !Ref S3OutputBucket
+
+  InitRankingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/prioritization/init_ranking/
+      Handler: handler_prioritization_retrieve_events.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - x86_64
+      MemorySize: 8192
+      Timeout: 600
+      Role: !GetAtt LambdaFunctionIAMRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:secops-python-packages:${Layer}
+      KmsKeyArn: !Ref DataEncryptionKeyArn
+      Environment:
+        Variables:
+          PG_DATABASE_NAME: !Ref PGDataServerDbName
+          PG_TRANSITION_DATABASE_NAME: "db_transition"
+          PG_USER_NAME: !Ref PGDataServerUser
+          PG_PASSWORD: !Ref PGDataServerPass
+          PG_TABLE_NAME: 'flagged'
+          NEO4J_USER_NAME: !Ref Neo4jUser
+          NEO4J_PASSWORD: !Ref Neo4jPass
+          USE_SERVER_NODE: "True"
+          RUNNING_FROM_LOCAL: "True"
+          PG_ENV_SERVER_HOST_NAME: !GetAtt PostgreSQLDatabase.Endpoint.Address
+          PG_AZURE_DATA_SERVER_HOST_NAME: !Ref AzureServer
+          S3_OUTPUT_BUCKET_NAME: !Ref S3OutputBucket
+
+  CheckAccountsLimit:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/prioritization/account_splitter/
+      Handler: handler_account_splitter.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - x86_64
+      MemorySize: 8192
+      Timeout: 600
+      Role: !GetAtt LambdaFunctionIAMRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+      KmsKeyArn: !Ref DataEncryptionKeyArn
+      Environment:
+        Variables:
+          ACCOUNT_LIMIT: 5
+
+  IdentifyScanningDateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/prioritization/identify_scanning_date/
+      Handler: handler_identify_scanning_date.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - x86_64
+      MemorySize: 8192
+      Timeout: 600
+      Role: !GetAtt LambdaFunctionIAMRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:secops-python-packages:${Layer}
+      KmsKeyArn: !Ref DataEncryptionKeyArn
+      Environment:
+        Variables:
+          PG_DATABASE_NAME: !Ref PGDataServerDbName
+          PG_TRANSITION_DATABASE_NAME: "db_transition"
+          PG_USER_NAME: !Ref PGDataServerUser
+          PG_PASSWORD: !Ref PGDataServerPass
+          PG_TABLE_NAME: 'flagged'
+          NEO4J_USER_NAME: !Ref Neo4jUser
+          NEO4J_PASSWORD: !Ref Neo4jPass
+          USE_SERVER_NODE: "True"
+          RUNNING_FROM_LOCAL: "True"
+          PG_ENV_SERVER_HOST_NAME: !GetAtt PostgreSQLDatabase.Endpoint.Address
+          PG_AZURE_DATA_SERVER_HOST_NAME: !Ref AzureServer
+          S3_OUTPUT_BUCKET_NAME: !Ref S3OutputBucket
+
+  AutoRemediationExecutionStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: AutoRemediationExecutionStatusFunction
+      CodeUri: ./src/auto_remediation/
+      Handler: handler_auto_remediation_execution_status.lambda_handler
+      Runtime: python3.8
+      Architectures:
+        - x86_64
+      MemorySize: 8192
+      Role: !GetAtt LambdaFunctionIAMRole.Arn
+      Timeout: 600
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:secops-python-packages:${Layer}
+      KmsKeyArn: !Ref DataEncryptionKeyArn
+      Environment:
+        Variables:
+          PG_USER_NAME: !Ref PGDataServerUser
+          PG_PASSWORD: !Ref PGDataServerPass
+          PG_ENV_SERVER_HOST_NAME: !GetAtt PostgreSQLDatabase.Endpoint.Address
+          RUNNING_FROM_DEV: !Ref IsDev
+          PG_DATABASE_NAME: !Ref PGDataServerDbName
+
+  AffectedAssetComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ServiceRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/batch.amazonaws.com/AWSServiceRoleForBatch"
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: 64
+        DesiredvCpus: 0
+        InstanceTypes:
+          - c6a.xlarge
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        Subnets:
+          - !Ref SubnetAPrivate
+          - !Ref SubnetBPrivate
+        InstanceRole: !Sub "arn:aws:iam::${AWS::AccountId}:instance-profile/ecsInstanceRole"
+
+
+  AffectedAssetComputeEnvironmentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ComputeEnvironmentInlinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - ec2:*
+              - ecs:*
+              - logs:*
+              - iam:*
+              - autoscaling:*
+              Resource: "*"
+
+  AffectedAssetJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref AffectedAssetComputeEnvironment
+
+  AffectedAssetJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      ContainerProperties:
+        Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AAECR}:latest"
+        Vcpus: 4
+        Memory: 4096
+        ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/ecsTaskExecutionRole"
+
+  PrioritizationStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "A description of my state machine",
+            "StartAt": "Identify scanning dates",
+            "States": {
+              "Identify scanning dates": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${IdentifyScanningDateFunction}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Retrieve flagged assets from detection databases"
+              },
+              "Retrieve flagged assets from detection databases": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${InitRankingFunction}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Check if data retrieval is successful"
+              },
+              "Check if data retrieval is successful": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Not": {
+                      "Variable": "$.status",
+                      "StringEquals": "success"
+                    },
+                    "Next": "Retrieve failed"
+                  }
+                ],
+                "Default": "Check Accounts"
+              },
+              "Retrieve failed": {
+                "Type": "Fail"
+              },
+              "Check Accounts": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${CheckAccountsLimit}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Job Iterator"
+              },
+              "Job Iterator": {
+                "Type": "Map",
+                "ItemProcessor": {
+                  "ProcessorConfig": {
+                    "Mode": "DISTRIBUTED",
+                    "ExecutionType": "STANDARD"
+                  },
+                  "StartAt": "Calculate number of affected assets per risky asset",
+                  "States": {
+                    "Calculate number of affected assets per risky asset": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::batch:submitJob.sync",
+                      "Parameters": {
+                        "JobDefinition": "${AffectedAssetJobDefinition}",
+                        "JobName": "Affected-assets",
+                        "JobQueue": "${AffectedAssetJobQueue}",
+                        "ContainerOverrides": {
+                          "Command": [
+                            "./affected_assets.sh",
+                            "Ref::params"
+                          ]
+                        },
+                        "Parameters": {
+                          "params.$": "$"
+                        }
+                      },
+                      "InputPath": "$.params",
+                      "ResultPath": null,
+                      "End": true
+                    }
+                  }
+                },
+                "Next": "Postprocessing",
+                "Label": "JobIterator",
+                "MaxConcurrency": 32,
+                "ResultPath": null,
+                "ItemsPath": "$.iterator_list",
+                "ToleratedFailurePercentage": 50
+              },
+              "Postprocessing": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "Payload.$": "$",
+                  "FunctionName": "${PostProcessingFunction}"
+                },
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "Lambda.ServiceException",
+                      "Lambda.AWSLambdaException",
+                      "Lambda.SdkClientException",
+                      "Lambda.TooManyRequestsException"
+                    ],
+                    "IntervalSeconds": 2,
+                    "MaxAttempts": 6,
+                    "BackoffRate": 2
+                  }
+                ],
+                "Next": "Check if postprocessing is done correctly"
+              },
+              "Check if postprocessing is done correctly": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.status",
+                    "StringEquals": "success",
+                    "Next": "Success"
+                  }
+                ],
+                "Default": "Postprocessing failed"
+              },
+              "Success": {
+                "Type": "Succeed"
+              },
+              "Postprocessing failed": {
+                "Type": "Fail"
+              }
+            }
+          }
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:*
+                  - batch:*
+                  - logs:*
+                  - cloudwatch:*
+                  - ec2:*
+                  - sns:*
+                  - rds:*
+                  - s3:*
+                  - ecr:*
+                  - sagemaker:*
+                  - lambda:InvokeFunction
+                  - events:*
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+
+Outputs:
+  ApiUrl:
+    Description: URL of Non-Graph API endpoint
+    Value: !Join
+      - ''
+      - - https://
+        - !Ref ApiGatewayApi
+        - '.execute-api.'
+        - !Ref 'AWS::Region'
+        - '.amazonaws.com/'
+        - !Ref Version
+  ApiLambdaFunctionArn:
+    Description: "API Lambda Function ARN"
+    Value: !GetAtt ApiFunction.Arn
+  PostgresEnvDatabaseEndpoint:
+    Description: "Postgres Env Database Endpoint"
+    Value: !GetAtt PostgreSQLDatabase.Endpoint.Address
+    Export:
+      Name: 'PostgresEnvDatabaseEndpoint'
